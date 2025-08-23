@@ -1,0 +1,16 @@
+# venv
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
+
+# локальні файли/секрети
+.env
+.env.*
+.DS_Store

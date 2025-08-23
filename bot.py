@@ -1,0 +1,444 @@
+import asyncio
+import os
+import ssl
+import smtplib
+import mimetypes
+from email.message import EmailMessage
+from email.utils import make_msgid, formatdate
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command
+from aiogram.types import (
+    Message, CallbackQuery,
+    BotCommand, BotCommandScopeAllGroupChats,
+    InlineKeyboardMarkup, InlineKeyboardButton
+)
+from aiogram.enums import ChatType
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
+from dotenv import load_dotenv
+
+# ---------- ENV ----------
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ALLOWED_CHAT_ID = int(os.getenv("ALLOWED_CHAT_ID", "0"))
+ALLOWED_USER_IDS = [int(x) for x in os.getenv("ALLOWED_USER_IDS", "").split(",") if x.strip().isdigit()]
+
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.ukr.net")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASS = os.getenv("SMTP_PASS")
+MAIL_TO    = os.getenv("MAIL_TO", SMTP_USER)
+MAIL_FROM  = os.getenv("MAIL_FROM", SMTP_USER)
+
+bot = Bot(token=BOT_TOKEN)
+dp  = Dispatcher(storage=MemoryStorage())
+
+# ---------- HELPERS ----------
+def _allowed(message: Message) -> bool:
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return False
+    if ALLOWED_CHAT_ID and message.chat.id != ALLOWED_CHAT_ID:
+        return False
+    if ALLOWED_USER_IDS:
+        return message.from_user and message.from_user.id in ALLOWED_USER_IDS
+    return True
+
+def _subject(prefix: str, theme: str, m: Message) -> str:
+    user = f"{m.from_user.full_name} (@{m.from_user.username})" if m.from_user else "Unknown"
+    return f"[TG→Mail] {prefix} — {theme.strip()} — від {user}"
+
+# HTML з «шапкою» — використовую для /toemail та !mail
+def _html_with_meta(text: str, m: Message, note: str = "") -> str:
+    chat_title = m.chat.title or str(m.chat.id)
+    user = f"{m.from_user.full_name} (@{m.from_user.username})" if m.from_user else "Unknown"
+    permalink = f"https://t.me/c/{str(m.chat.id)[4:]}/{m.message_id}" if str(m.chat.id).startswith("-100") else "N/A"
+    return f"""
+    <html><body>
+      <div style="font-family:Arial,Helvetica,sans-serif; font-size:16px; color:#000; line-height:1.5;">
+        <p><b>Чат:</b> {chat_title} (id: {m.chat.id})</p>
+        <p><b>Відправник:</b> {user} (id: {m.from_user.id if m.from_user else 'N/A'})</p>
+        <p><b>Посилання на повідомлення:</b> {permalink}</p>
+        {'<p><i>'+note+'</i></p>' if note else ''}
+        <hr/>
+        <pre style="white-space:pre-wrap; font-family:inherit; font-size:inherit; color:inherit; margin:0;">{text}</pre>
+      </div>
+    </body></html>
+    """
+
+# Простий HTML без «шапки» — спеціально для заявок
+def _html_plain(text: str) -> str:
+    return f"""
+    <html><body>
+      <div style="font-family:Arial,Helvetica,sans-serif; font-size:16px; color:#000; line-height:1.5;">
+        <pre style="white-space:pre-wrap; font-family:inherit; font-size:inherit; color:inherit; margin:0;">{text}</pre>
+      </div>
+    </body></html>
+    """
+
+def send_email(subject: str, html_body: str, attachments: list[tuple[str, bytes]] = None):
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = MAIL_FROM
+    msg["To"] = MAIL_TO
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid()
+    msg.set_content("Це HTML-лист.")
+    msg.add_alternative(html_body, subtype="html")
+
+    for filename, data in (attachments or []):
+        ctype, _ = mimetypes.guess_type(filename)
+        if ctype is None:
+            ctype = "application/octet-stream"
+        maintype, subtype = ctype.split("/", 1)
+        msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=filename)
+
+    if SMTP_PORT == 465:
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context) as s:
+            s.login(SMTP_USER, SMTP_PASS)
+            s.send_message(msg)
+    else:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
+            s.starttls()
+            s.login(SMTP_USER, SMTP_PASS)
+            s.send_message(msg)
+
+async def _fetch(file_id: str, name: str) -> tuple[str, bytes]:
+    f = await bot.get_file(file_id)
+    file = await bot.download_file(f.file_path)
+    data = file.read()
+    return name, data
+
+async def _safe_del(chat_id: int, message_id: int | None):
+    if not message_id:
+        return
+    try:
+        await bot.delete_message(chat_id, message_id)
+    except Exception:
+        pass
+
+def _cancel_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="❌ Скасувати", callback_data="cancel")]]
+    )
+
+# нова клавіатура для останнього кроку
+def _submit_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Відправити", callback_data="submit"),
+            InlineKeyboardButton(text="❌ Скасувати", callback_data="cancel"),
+        ]]
+    )
+
+# дозволяє підставляти будь-яку клавіатуру (за замовчуванням — тільки «Скасувати»)
+async def _ask_next(message: Message, state: FSMContext, html_text: str, kb: InlineKeyboardMarkup | None = None):
+    kb = kb or _cancel_kb()
+    sent = await message.answer(html_text, reply_markup=kb, parse_mode="HTML")
+    await state.update_data(bot_q=sent.message_id)
+
+# ---------- STATES (мастер заявки) ----------
+class Zayavka(StatesGroup):
+    wait_fullname = State()
+    wait_shop_addr = State()
+    wait_tax_id    = State()
+    wait_phone     = State()
+    wait_product   = State()
+    wait_price     = State()
+    wait_downpay   = State()
+    wait_grace     = State()
+    wait_attachments = State()
+
+# ---------- SIMPLE COMMANDS ----------
+@dp.message(Command("cancel"))
+async def cancel_cmd(message: Message, state: FSMContext):
+    data = await state.get_data()
+    await _safe_del(message.chat.id, data.get("bot_q"))
+    await state.clear()
+    await message.reply("❌ Скасовано. Можна почати знову командою /zayavka")
+
+@dp.callback_query(F.data == "cancel")
+async def cancel_cb(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    await _safe_del(call.message.chat.id, data.get("bot_q"))
+    await state.clear()
+    await call.message.answer("❌ Скасовано. Можна почати знову командою /zayavka")
+    await call.answer()
+
+# (Залишив для зручності — не показується у “/”-меню)
+@dp.message(Command("toemail"))
+async def forward_reply(message: Message):
+    if not _allowed(message):
+        return
+    if not message.reply_to_message:
+        await message.reply("Зробіть реплай на повідомлення. Приклад: /toemail Тема")
+        return
+
+    theme = message.text.split(" ", 1)[1] if " " in message.text else "Без теми"
+    origin = message.reply_to_message
+    body_text = origin.text or origin.caption or "[Без тексту — вкладення]"
+
+    attachments = []
+    if origin.photo:
+        ph = origin.photo[-1]
+        attachments.append(await _fetch(ph.file_id, f"photo_{origin.message_id}.jpg"))
+    if origin.document:
+        d = origin.document
+        name = d.file_name or f"document_{origin.message_id}"
+        attachments.append(await _fetch(d.file_id, name))
+    if origin.voice:
+        v = origin.voice
+        attachments.append(await _fetch(v.file_id, f"voice_{origin.message_id}.ogg"))
+    if origin.audio:
+        a = origin.audio
+        attachments.append(await _fetch(a.file_id, a.file_name or f"audio_{origin.message_id}.mp3"))
+    if origin.video:
+        v = origin.video
+        attachments.append(await _fetch(v.file_id, f"video_{origin.message_id}.mp4"))
+    if origin.video_note:
+        vn = origin.video_note
+        attachments.append(await _fetch(vn.file_id, f"videonote_{origin.message_id}.mp4"))
+
+    try:
+        await asyncio.to_thread(
+            send_email,
+            _subject("REPLY", theme, origin),
+            _html_with_meta(body_text, origin, "Відправлено з реплаю."),
+            attachments
+        )
+        await message.reply("✅ Відправлено на пошту.")
+    except Exception as e:
+        await message.reply(f"❌ Помилка надсилання: {e}")
+
+@dp.message(F.text.startswith("!mail"))
+async def trigger_mail(message: Message):
+    if not _allowed(message):
+        return
+    raw = message.text[len("!mail"):].strip()
+    theme, text = ("Без теми", raw or "[порожньо]") if "|" not in raw else [x.strip() for x in raw.split("|", 1)]
+    try:
+        await asyncio.to_thread(
+            send_email,
+            _subject("MSG", theme, message),
+            _html_with_meta(text, message, "Відправлено тригером !mail."),
+            []
+        )
+        await message.reply("✅ Відправлено на пошту.")
+    except Exception as e:
+        await message.reply(f"❌ Помилка надсилання: {e}")
+
+# ---------- /ZAYAVKA WIZARD ----------
+@dp.message(Command("zayavka"))
+async def zayavka_start(message: Message, state: FSMContext):
+    if not _allowed(message):
+        return
+    await state.clear()
+    txt = (
+        "📝 <b>Відправити заявку</b>\n\n"
+        "Тема листа буде такою:\n"
+        "<code>(заявка) ПІБ_клієнта mobiletrend.com.ua</code>\n\n"
+        "Введіть, будь ласка, <b>ПІБ клієнта</b> одним повідомленням."
+    )
+    await state.set_state(Zayavka.wait_fullname)
+    await _ask_next(message, state, txt)
+
+@dp.message(Zayavka.wait_fullname)
+async def z_fullname(message: Message, state: FSMContext):
+    fio = (message.text or "").strip()
+    if not fio:
+        await message.reply("Будь ласка, введіть ПІБ клієнта.")
+        return
+    data = await state.get_data()
+    await _safe_del(message.chat.id, data.get("bot_q"))
+    await _safe_del(message.chat.id, message.message_id)
+    await state.update_data(fullname=fio)
+    await state.set_state(Zayavka.wait_shop_addr)
+    await _ask_next(message, state, "📍 <b>Адресса ТТ</b>\nВведіть адресу торгової точки.")
+
+@dp.message(Zayavka.wait_shop_addr)
+async def z_shop_addr(message: Message, state: FSMContext):
+    data = await state.get_data()
+    await state.update_data(shop_addr=(message.text or "").strip())
+    await _safe_del(message.chat.id, data.get("bot_q"))
+    await _safe_del(message.chat.id, message.message_id)
+    await state.set_state(Zayavka.wait_tax_id)
+    await _ask_next(message, state, "🧾 <b>ІПН клієнта (податковий код)</b>")
+
+@dp.message(Zayavka.wait_tax_id)
+async def z_tax(message: Message, state: FSMContext):
+    data = await state.get_data()
+    await state.update_data(tax_id=(message.text or "").strip())
+    await _safe_del(message.chat.id, data.get("bot_q"))
+    await _safe_del(message.chat.id, message.message_id)
+    await state.set_state(Zayavka.wait_phone)
+    await _ask_next(message, state, "📱 <b>Мобільний телефон клієнта</b>")
+
+@dp.message(Zayavka.wait_phone)
+async def z_phone(message: Message, state: FSMContext):
+    data = await state.get_data()
+    await state.update_data(phone=(message.text or "").strip())
+    await _safe_del(message.chat.id, data.get("bot_q"))
+    await _safe_del(message.chat.id, message.message_id)
+    await state.set_state(Zayavka.wait_product)
+    await _ask_next(message, state, "📦 <b>Повна назва товару</b>\n(якщо це телефон — вкажіть обсяг пам’яті та колір)")
+
+@dp.message(Zayavka.wait_product)
+async def z_product(message: Message, state: FSMContext):
+    data = await state.get_data()
+    await state.update_data(product=(message.text or "").strip())
+    await _safe_del(message.chat.id, data.get("bot_q"))
+    await _safe_del(message.chat.id, message.message_id)
+    await state.set_state(Zayavka.wait_price)
+    await _ask_next(message, state, "💵 <b>Вартість товару</b>")
+
+@dp.message(Zayavka.wait_price)
+async def z_price(message: Message, state: FSMContext):
+    data = await state.get_data()
+    await state.update_data(price=(message.text or "").strip())
+    await _safe_del(message.chat.id, data.get("bot_q"))
+    await _safe_del(message.chat.id, message.message_id)
+    await state.set_state(Zayavka.wait_downpay)
+    await _ask_next(message, state, "💳 <b>Перший внесок</b>")
+
+@dp.message(Zayavka.wait_downpay)
+async def z_downpay(message: Message, state: FSMContext):
+    data = await state.get_data()
+    await state.update_data(downpay=(message.text or "").strip())
+    await _safe_del(message.chat.id, data.get("bot_q"))
+    await _safe_del(message.chat.id, message.message_id)
+    await state.set_state(Zayavka.wait_grace)
+    await _ask_next(message, state, "📆 <b>Кількість платежів Грейс</b> (4 чи 6)")
+
+@dp.message(Zayavka.wait_grace)
+async def z_to_attachments(message: Message, state: FSMContext):
+    data_prev = await state.get_data()
+    await state.update_data(grace=(message.text or "").strip(), files=[])
+    await _safe_del(message.chat.id, data_prev.get("bot_q"))
+    await _safe_del(message.chat.id, message.message_id)
+    await state.set_state(Zayavka.wait_attachments)
+    intro = (
+        "📎 <b>Додайте файли для заявки</b>\n"
+        "• Фото клієнта на ТТ з паспортом у руках\n"
+        "• Фото ІПН\n"
+        "• Фото паспорта (усі сторінки з даними) або ID-картки (2 боки)\n"
+        "• Фото витяга (якщо ID-картка)\n\n"
+        "Надсилайте фото/документи окремими повідомленнями.\n"
+        "Коли закінчите — натисніть <b>✅ Відправити</b> або введіть <b>/done</b>."
+    )
+    await _ask_next(message, state, intro + "\n\n<b>Додано файлів:</b> 0", kb=_submit_kb())
+
+# ---- Вкладення: файли ----
+@dp.message(Zayavka.wait_attachments, F.photo | F.document)
+async def z_collect_files(message: Message, state: FSMContext):
+    data = await state.get_data()
+    files: list[tuple[str, bytes]] = data.get("files", [])
+
+    if message.photo:
+        ph = message.photo[-1]
+        name, content = await _fetch(ph.file_id, f"photo_{message.message_id}.jpg")
+        files.append((name, content))
+    elif message.document:
+        d = message.document
+        name = d.file_name or f"document_{message.message_id}"
+        name, content = await _fetch(d.file_id, name)
+        files.append((name, content))
+
+    await state.update_data(files=files)
+    await _safe_del(message.chat.id, message.message_id)
+    await _safe_del(message.chat.id, data.get("bot_q"))
+    await _ask_next(
+        message, state,
+        "📎 <b>Додайте файли для заявки</b>\n"
+        "Надсилайте ще, або натисніть <b>✅ Відправити</b> / введіть <b>/done</b>.\n\n"
+        f"<b>Додано файлів:</b> {len(files)}",
+        kb=_submit_kb()
+    )
+
+# ---- Завершення вкладень: /done ----
+@dp.message(Zayavka.wait_attachments, Command("done"))
+async def z_finish_attachments(message: Message, state: FSMContext):
+    await _finalize_and_send(message, state)
+
+# ---- Завершення вкладень: кнопка "✅ Відправити" ----
+@dp.callback_query(Zayavka.wait_attachments, F.data == "submit")
+async def cb_submit(call: CallbackQuery, state: FSMContext):
+    await _finalize_and_send(call.message, state)
+    await call.answer()
+
+async def _finalize_and_send(msg: Message, state: FSMContext):
+    data = await state.get_data()
+    await _safe_del(msg.chat.id, data.get("bot_q"))
+
+    subject = f"(заявка) {data.get('fullname','').strip()} mobiletrend.com.ua"
+    body_text = (
+        f"Заявка від @{msg.from_user.username or msg.from_user.full_name} (id: {msg.from_user.id})\n"
+        f"ПІБ клієнта: {data.get('fullname','')}\n"
+        f"Адреса ТТ: {data.get('shop_addr','')}\n"
+        f"ІПН клієнта: {data.get('tax_id','')}\n"
+        f"Моб. телефон: {data.get('phone','')}\n"
+        f"Товар (повна назва): {data.get('product','')}\n"
+        f"Вартість товару: {data.get('price','')}\n"
+        f"Перший внесок: {data.get('downpay','')}\n"
+        f"Кількість платежів (Грейс): {data.get('grace','')}\n"
+        f"Кількість вкладень: {len(data.get('files', []))}\n"
+    )
+
+    summary = (
+        "✅ <b>Заявку відправлено на пошту.</b>\n\n"
+        "<b>Що відправлено:</b>\n"
+        f"• <b>ПІБ клієнта:</b> {data.get('fullname','')}\n"
+        f"• <b>Адреса ТТ:</b> {data.get('shop_addr','')}\n"
+        f"• <b>ІПН клієнта:</b> {data.get('tax_id','')}\n"
+        f"• <b>Моб. телефон:</b> {data.get('phone','')}\n"
+        f"• <b>Товар:</b> {data.get('product','')}\n"
+        f"• <b>Вартість товару:</b> {data.get('price','')}\n"
+        f"• <b>Перший внесок:</b> {data.get('downpay','')}\n"
+        f"• <b>Кількість платежів (Грейс):</b> {data.get('grace','')}\n"
+        f"• <b>Вкладень:</b> {len(data.get('files', []))}"
+    )
+
+    try:
+        await asyncio.to_thread(
+            send_email,
+            subject,
+            _html_plain(body_text),
+            data.get('files', [])
+        )
+        await msg.answer(summary, parse_mode="HTML")
+    except Exception as e:
+        await msg.answer(f"❌ Помилка надсилання: {e}")
+    finally:
+        await state.clear()
+
+# ---- Catch-all під час збору вкладень ----
+@dp.message(Zayavka.wait_attachments)
+async def z_ignore_other(message: Message, state: FSMContext):
+    if message.text and message.text.startswith('/'):
+        return
+    data = await state.get_data()
+    await _safe_del(message.chat.id, message.message_id)
+    await _safe_del(message.chat.id, data.get("bot_q"))
+    await _ask_next(
+        message, state,
+        "📎 Надішліть фото/документ як повідомлення, або завершіть <b>/done</b> / натисніть <b>✅ Відправити</b>.",
+        kb=_submit_kb()
+    )
+
+# ---------- "/" MENU ----------
+async def setup_commands():
+    cmds = [
+        BotCommand(command="zayavka", description="Відправити заявку"),
+        BotCommand(command="cancel",  description="Скасувати заповнення заявки"),
+    ]
+    await bot.set_my_commands(cmds, scope=BotCommandScopeAllGroupChats())
+
+# ---------- RUN ----------
+async def main():
+    await setup_commands()
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
