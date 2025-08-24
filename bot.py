@@ -7,7 +7,7 @@ from email.message import EmailMessage
 from email.utils import make_msgid, formatdate
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message, CallbackQuery,
     BotCommand, BotCommandScopeAllGroupChats,
@@ -23,7 +23,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-# Підтримуємо як один id, так і список (ALLOWED_CHAT_IDS через кому).
 ALLOWED_CHAT_ID = int(os.getenv("ALLOWED_CHAT_ID", "0") or "0")
 ALLOWED_CHAT_IDS = [
     int(x) for x in os.getenv("ALLOWED_CHAT_IDS", "").split(",")
@@ -41,32 +40,30 @@ MAIL_FROM  = os.getenv("MAIL_FROM", SMTP_USER)
 bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher(storage=MemoryStorage())
 
+# підставимо юзернейм у main()
+BOT_USERNAME: str | None = None
+
 # ---------- HELPERS ----------
 def _allowed(message: Message) -> bool:
-    # Дозвіл за чатами (whitelist)
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return False
-
     allowed_ids = set(ALLOWED_CHAT_IDS)
     if ALLOWED_CHAT_ID:
         allowed_ids.add(ALLOWED_CHAT_ID)
-
     if allowed_ids and message.chat.id not in allowed_ids:
         return False
-
     if ALLOWED_USER_IDS:
         return message.from_user and message.from_user.id in ALLOWED_USER_IDS
     return True
 
 def _allowed_for_wizard(message: Message) -> bool:
-    # Майстер заявки дозволяємо або в дозволеній групі, або в PRIVATЕ
+    # майстер заявки дозволяємо або в дозволеній групі, або в приваті
     return (message.chat.type == ChatType.PRIVATE) or _allowed(message)
 
 def _subject(prefix: str, theme: str, m: Message) -> str:
     user = f"{m.from_user.full_name} (@{m.from_user.username})" if m.from_user else "Unknown"
     return f"[TG→Mail] {prefix} — {theme.strip()} — від {user}"
 
-# HTML з «шапкою» — для /toemail та !mail
 def _html_with_meta(text: str, m: Message, note: str = "") -> str:
     chat_title = m.chat.title or str(m.chat.id)
     user = f"{m.from_user.full_name} (@{m.from_user.username})" if m.from_user else "Unknown"
@@ -84,7 +81,6 @@ def _html_with_meta(text: str, m: Message, note: str = "") -> str:
     </body></html>
     """
 
-# Простий HTML без «шапки» — для заявок
 def _html_plain(text: str) -> str:
     return f"""
     <html><body>
@@ -136,9 +132,16 @@ async def _safe_del(chat_id: int, message_id: int | None):
     except Exception:
         pass
 
+# URL-кнопка для переходу в приват
+def _private_link_kb(payload: str) -> InlineKeyboardMarkup:
+    username = BOT_USERNAME or ""
+    url = f"https://t.me/{username}?start={payload}" if username else "https://t.me/"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🔒 Заповнювати в особистих", url=url)]]
+    )
+
 # --- іменні клавіатури (прив'язані до автора) ---
 def _form_kb(owner_id: int, with_send: bool = False) -> InlineKeyboardMarkup:
-    # callback_data: form:<owner_id>:<action>
     row = [InlineKeyboardButton(text="❌ Скасувати", callback_data=f"form:{owner_id}:cancel")]
     if with_send:
         row.insert(0, InlineKeyboardButton(text="✅ Відправити", callback_data=f"form:{owner_id}:send"))
@@ -149,7 +152,7 @@ async def _ask_next(message: Message, state: FSMContext, html_text: str, with_se
     sent = await message.answer(html_text, reply_markup=_form_kb(owner_id, with_send), parse_mode="HTML")
     await state.update_data(bot_q=sent.message_id, owner_id=owner_id)
 
-# ---------- STATES (мастер заявки) ----------
+# ---------- STATES ----------
 class Zayavka(StatesGroup):
     wait_fullname = State()
     wait_shop_addr = State()
@@ -161,10 +164,9 @@ class Zayavka(StatesGroup):
     wait_grace     = State()
     wait_attachments = State()
 
-# ---------- SIMPLE COMMANDS ----------
+# ---------- COMMANDS ----------
 @dp.message(Command("cancel"))
 async def cancel_cmd(message: Message, state: FSMContext):
-    # Скасовує лише свій стан (FSM ізольований по користувачу)
     data = await state.get_data()
     await _safe_del(message.chat.id, data.get("bot_q"))
     await state.clear()
@@ -172,15 +174,12 @@ async def cancel_cmd(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("form:"))
 async def form_buttons(call: CallbackQuery, state: FSMContext):
-    # Єдиний обробник для "✅ Відправити" та "❌ Скасувати"
     try:
         _, owner_id_str, action = call.data.split(":")
         owner_id = int(owner_id_str)
     except Exception:
         await call.answer("Невірні дані кнопки.", show_alert=True)
         return
-
-    # чужа кнопка — нічого не робимо
     if not call.from_user or call.from_user.id != owner_id:
         await call.answer("Ця кнопка не для вас 🙂", show_alert=True)
         return
@@ -195,7 +194,6 @@ async def form_buttons(call: CallbackQuery, state: FSMContext):
         return
 
     if action == "send":
-        # Фіналізація (аналог /done)
         files = data.get("files", [])
         subject = f"(заявка) {data.get('fullname','').strip()} mobiletrend.com.ua"
         body_text = (
@@ -234,73 +232,37 @@ async def form_buttons(call: CallbackQuery, state: FSMContext):
             await call.answer()
         return
 
-# (Залишив для зручності — не показується у “/”-меню)
-@dp.message(Command("toemail"))
-async def forward_reply(message: Message):
-    if not _allowed(message):
-        return
-    if not message.reply_to_message:
-        await message.reply("Зробіть реплай на повідомлення. Приклад: /toemail Тема")
-        return
+# /start з payload для приватного запуску майстра
+@dp.message(CommandStart())
+async def start_private(message: Message, state: FSMContext):
+    # payload після /start
+    payload = ""
+    if message.text:
+        parts = message.text.split(maxsplit=1)
+        if len(parts) > 1:
+            payload = parts[1].strip()
 
-    theme = message.text.split(" ", 1)[1] if " " in message.text else "Без теми"
-    origin = message.reply_to_message
-    body_text = origin.text or origin.caption or "[Без тексту — вкладення]"
-
-    attachments = []
-    if origin.photo:
-        ph = origin.photo[-1]
-        attachments.append(await _fetch(ph.file_id, f"photo_{origin.message_id}.jpg"))
-    if origin.document:
-        d = origin.document
-        name = d.file_name or f"document_{origin.message_id}"
-        attachments.append(await _fetch(d.file_id, name))
-    if origin.voice:
-        v = origin.voice
-        attachments.append(await _fetch(v.file_id, f"voice_{origin.message_id}.ogg"))
-    if origin.audio:
-        a = origin.audio
-        attachments.append(await _fetch(a.file_id, a.file_name or f"audio_{origin.message_id}.mp3"))
-    if origin.video:
-        v = origin.video
-        attachments.append(await _fetch(v.file_id, f"video_{origin.message_id}.mp4"))
-    if origin.video_note:
-        vn = origin.video_note
-        attachments.append(await _fetch(vn.file_id, f"videonote_{origin.message_id}.mp4"))
-
-    try:
-        await asyncio.to_thread(
-            send_email,
-            _subject("REPLY", theme, origin),
-            _html_with_meta(body_text, origin, "Відправлено з реплаю."),
-            attachments
-        )
-        await message.reply("✅ Відправлено на пошту.")
-    except Exception as e:
-        await message.reply(f"❌ Помилка надсилання: {e}")
-
-@dp.message(F.text.startswith("!mail"))
-async def trigger_mail(message: Message):
-    if not _allowed(message):
-        return
-    raw = message.text[len("!mail"):].strip()
-    theme, text = ("Без теми", raw or "[порожньо]") if "|" not in raw else [x.strip() for x in raw.split("|", 1)]
-    try:
-        await asyncio.to_thread(
-            send_email,
-            _subject("MSG", theme, message),
-            _html_with_meta(text, message, "Відправлено тригером !mail."),
-            []
-        )
-        await message.reply("✅ Відправлено на пошту.")
-    except Exception as e:
-        await message.reply(f"❌ Помилка надсилання: {e}")
+    if payload in ("z", "zayavka"):
+        # стартуємо той самий майстер, що і по /zayavka
+        await zayavka_start(message, state)
+    else:
+        await message.answer("Привіт! Напишіть /zayavka, щоб подати заявку.")
 
 # ---------- /ZAYAVKA WIZARD ----------
 @dp.message(Command("zayavka"))
 async def zayavka_start(message: Message, state: FSMContext):
+    # якщо це група — пропонуємо перейти у приват
+    if message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        note = (
+            "Щоб дані були приватні, запустіть майстер в особистих повідомленнях."
+        )
+        await message.answer(note, reply_markup=_private_link_kb("z"))
+        return
+
+    # приватний чат або дозволена логіка
     if not _allowed_for_wizard(message):
         return
+
     await state.clear()
     txt = (
         "📝 <b>Відправити заявку</b>\n\n"
@@ -396,7 +358,6 @@ async def z_to_attachments(message: Message, state: FSMContext):
     )
     await _ask_next(message, state, intro + "\n\n<b>Додано файлів:</b> 0", with_send=True)
 
-# ---- Вкладення: файли ----
 @dp.message(Zayavka.wait_attachments, F.photo | F.document)
 async def z_collect_files(message: Message, state: FSMContext):
     data = await state.get_data()
@@ -423,7 +384,6 @@ async def z_collect_files(message: Message, state: FSMContext):
         with_send=True
     )
 
-# ---- Завершення вкладень: /done (альтернатива кнопці) ----
 @dp.message(Zayavka.wait_attachments, Command("done"))
 async def z_finish_attachments(message: Message, state: FSMContext):
     data = await state.get_data()
@@ -458,19 +418,13 @@ async def z_finish_attachments(message: Message, state: FSMContext):
     )
 
     try:
-        await asyncio.to_thread(
-            send_email,
-            subject,
-            _html_plain(body_text),
-            data.get('files', [])
-        )
+        await asyncio.to_thread(send_email, subject, _html_plain(body_text), data.get('files', []))
         await message.answer(summary, parse_mode="HTML")
     except Exception as e:
         await message.answer(f"❌ Помилка надсилання: {e}")
     finally:
         await state.clear()
 
-# ---- Catch-all під час збору вкладень ----
 @dp.message(Zayavka.wait_attachments)
 async def z_ignore_other(message: Message, state: FSMContext):
     if message.text and message.text.startswith('/'):
@@ -494,6 +448,9 @@ async def setup_commands():
 
 # ---------- RUN ----------
 async def main():
+    global BOT_USERNAME
+    me = await bot.get_me()
+    BOT_USERNAME = me.username  # для deep-link кнопки
     await setup_commands()
     await dp.start_polling(bot)
 
