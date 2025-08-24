@@ -3,6 +3,7 @@ import os
 import ssl
 import smtplib
 import mimetypes
+import time
 from email.message import EmailMessage
 from email.utils import make_msgid, formatdate
 
@@ -41,6 +42,11 @@ bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher(storage=MemoryStorage())
 
 BOT_USERNAME: str | None = None  # підставляємо в main()
+
+# --- короткочасні "мітки очікування" для автозапуску у приваті ---
+# user_id -> unix_deadline
+PENDING_START: dict[int, float] = {}
+PENDING_TTL_SEC = 5 * 60  # 5 хвилин
 
 # ---------- HELPERS ----------
 def _allowed(message: Message) -> bool:
@@ -240,39 +246,53 @@ async def form_buttons(call: CallbackQuery, state: FSMContext):
             await call.answer()
         return
 
-# приватний старт із payload
+# приватний старт із payload або з "мітки очікування"
 @dp.message(CommandStart())
 async def start_private(message: Message, state: FSMContext):
+    # 1) пробуємо payload
     payload = ""
     if message.text:
         parts = message.text.split(maxsplit=1)
         if len(parts) > 1:
             payload = parts[1].strip()
 
-    # персональний deep-link типу z<user_id>
-    if payload.startswith("z"):
-        want_id = payload[1:]
-        if want_id.isdigit() and message.from_user and message.from_user.id == int(want_id):
-            await zayavka_start(message, state)
-            return
-        else:
-            await message.answer(
-                "Це посилання не для вас. Запустіть /zayavka у групі і натисніть власну кнопку.",
-                disable_notification=True
-            )
-            return
+    ok_to_autostart = False
+    if payload.startswith("z") and message.from_user and payload[1:].isdigit():
+        ok_to_autostart = (message.from_user.id == int(payload[1:]))
+
+    # 2) якщо payload немає — дивимось "мітку очікування"
+    if not ok_to_autostart and message.from_user:
+        uid = message.from_user.id
+        now = time.time()
+        if uid in PENDING_START and PENDING_START[uid] > now:
+            ok_to_autostart = True
+        # почистимо прострочені
+        for k, v in list(PENDING_START.items()):
+            if v <= now:
+                PENDING_START.pop(k, None)
+
+    if ok_to_autostart:
+        await zayavka_start(message, state)
+        return
 
     await message.answer("Привіт! Напишіть /zayavka, щоб подати заявку.", disable_notification=True)
 
 # ---------- /ZAYAVKA WIZARD ----------
 @dp.message(Command("zayavka"))
 async def zayavka_start(message: Message, state: FSMContext):
+    # якщо в групі — даємо приватну кнопку і ставимо "мітку очікування" автору
     if message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        if not _allowed(message):
+            return
         note = "Щоб дані були приватні, запустіть майстер в особистих повідомленнях."
         owner_id = message.from_user.id if message.from_user else 0
-        await message.answer(note, reply_markup=_private_link_kb(owner_id))
+        # мітка очікування 5 хв
+        if owner_id:
+            PENDING_START[owner_id] = time.time() + PENDING_TTL_SEC
+        await message.answer(note, reply_markup=_private_link_kb(owner_id), disable_notification=True)
         return
 
+    # приватний діалог — працюємо як майстер
     if not _allowed_for_wizard(message):
         return
 
@@ -451,7 +471,7 @@ async def z_ignore_other(message: Message, state: FSMContext):
         with_send=True
     )
 
-# ---- інші ваші команди збережено як було (без зміни логіки) ----
+# ---- інші команди як були ----
 
 @dp.message(Command("toemail"))
 async def forward_reply(message: Message):
